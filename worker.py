@@ -210,8 +210,8 @@ async def process_queued_jobs():
                 else:
                     raise ValueError("No source content (no text or URL).")
 
-                # Fire cinematic video
-                status  = await client.artifacts.generate_cinematic_video(
+                # Fire video generation (standard Video Overview -- works with Pro)
+                status  = await client.artifacts.generate_video(
                     nb_id,
                     instructions=VIDEO_INSTRUCTION,
                 )
