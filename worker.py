@@ -13,6 +13,7 @@ Required env vars (set in Railway dashboard):
   NOTEBOOKLM_STORAGE_STATE_B64   (base64-encoded storage_state.json)
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
+  GEMINI_API_KEY                 (for bridge doc generation)
 """
 
 import asyncio
@@ -33,6 +34,7 @@ SUPABASE_KEY     = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 TG_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID       = os.environ.get("TELEGRAM_CHAT_ID", "")
 SESSION_B64      = os.environ.get("NOTEBOOKLM_STORAGE_STATE_B64", "")
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 OUTPUT_DIR       = Path("/tmp/bk_videos")
 STORAGE_PATH     = Path("/root/.notebooklm/storage_state.json")
 
@@ -40,9 +42,119 @@ VIDEO_INSTRUCTION = (
     "Create an engaging, warm cinematic overview for parents of neurodiverse children. "
     "Tone: empathetic, clear, and reassuring. Focus on practical takeaways and specific benefits. "
     "Brand: Bright Kids AI -- empowering every bright mind. "
-    "Slant the content toward how Bright Kids AI helps children and families in a genuine, "
-    "non-pushy way that builds trust and encourages parents to learn more."
+    "The third source describes the Bright Kids AI tools that families are already using. "
+    "Where it fits naturally -- not as a pitch, but as a 'families are finding this helps' moment -- "
+    "name one or two of those tools by name and show how they connect to what this article covers. "
+    "If a connection does not feel genuine, leave it out entirely."
 )
+
+# ---------------------------------------------------------------------------
+# Bright Kids AI ecosystem context (added to every notebook as a source)
+# ---------------------------------------------------------------------------
+
+BK_ECOSYSTEM_CONTEXT = """\
+Bright Kids AI — Tools Families Are Using
+
+This document describes the tools available inside Bright Kids AI, written from
+the perspective of how parents and children actually use them day to day.
+
+---
+
+MY STARS (Emotional Check-In)
+
+My Stars is a visual check-in tool built around four Star States — a simple
+framework that replaces the need for words when a child is overwhelmed. Each
+state has its own color, emoji, and name:
+
+  Sleepy Star (violet / 😴) — low energy, tired, disconnected
+  Bright Star (teal / ⭐) — calm, focused, ready to learn
+  Zoom Star (amber / 💫) — excited, buzzing, high energy
+  Big Boom (orange / 💥) — overwhelmed, dysregulated, flooded
+
+When a child opens My Stars, they see their own custom avatar and tap the star
+that matches how they feel. The key principle: all four states are okay. The
+goal is not to fix the state but to name it, because named feelings are easier
+to work with. The tool works for children who cannot yet read and for children
+of any age — it removes the need for verbal emotional vocabulary in the moment.
+
+Parents often use it at predictable transition points: arriving home from
+school, before homework, after therapy appointments, or at bedtime.
+
+---
+
+WEEKLY BRIEF (Pattern Recognition)
+
+After seven consecutive check-ins, parents see a Weekly Brief — a visual
+breakdown showing which star states appeared most often and when. This is not
+about frequency counts; it is about pattern recognition. Parents start noticing
+that Big Boom clusters after school on Tuesdays, or that Sleepy Star appears
+every morning before the child has eaten. Once a pattern is visible, it becomes
+actionable. The Weekly Brief turns daily micro-observations into a picture a
+parent can bring to a therapist, teacher, or IEP meeting.
+
+---
+
+PERSONALIZED STORIES
+
+Personalized storybooks place the child as the main character in every story.
+The child's name, interests, favorite toy, reading level, and current learning
+goals are all woven into the narrative and illustrations. Stories are generated
+by AI but feel handcrafted because they are built entirely from what the parent
+has shared about their specific child.
+
+For neurodiverse children, seeing themselves represented in stories — not as a
+character who overcomes a disability, but as the hero doing something they love
+— has a different quality than reading about a generic protagonist. Parents
+report children asking to hear the same story repeatedly, which is itself a
+form of emotional processing.
+
+Stories can be read aloud in the Explorer app with audio narration, making them
+accessible to pre-readers and children who process better through listening.
+
+---
+
+PERSONALIZED SONGS
+
+Original songs are generated using the child's name, favorite things, and
+current themes the parent wants to reinforce (a new school routine, learning to
+ask for help, celebrating a milestone). Songs are short, melodic, and designed
+to be played on repeat — which is exactly how many children with sensory
+processing differences or ADHD naturally engage with music.
+
+Parents use songs as transition anchors: a specific song signals that it is time
+to get ready for school, or that the bedtime routine is starting. Because the
+song uses the child's name and references their actual interests, it cuts
+through in a way that a generic transition cue does not.
+
+---
+
+JENNY (Parenting Guide)
+
+Jenny is a warm, conversational guide inside the platform for parents — not for
+children. Parents can ask her about what they are observing, describe a
+situation they are stuck on, or ask for a recommendation. She responds in two
+to three sentences: enough to be useful, short enough not to overwhelm.
+
+Jenny is designed for the moment between noticing something and knowing what to
+do about it. She does not replace therapists or clinicians. She is the voice
+that helps a parent feel less alone at 10pm when their child had a hard day and
+they do not know what to try next.
+
+---
+
+CHILD PROFILE
+
+Every tool in Bright Kids AI is driven by a child profile that the parent builds
+with the help of Sunny, a profile creation assistant. The profile captures first
+name, age, reading level, interests, favorite toy, and a description of the
+child's appearance for illustrations. This profile is what makes every story,
+song, and check-in feel personal rather than generic.
+
+Parents update profiles as children grow. A reading level that was accurate at
+age five needs revisiting at age seven. Adding a new interest unlocks new story
+themes. The profile is not a diagnostic record — it is a creative brief that
+the AI uses to build something that feels like it was made for this one child.
+"""
 
 # ---------------------------------------------------------------------------
 # Bootstrap: write NotebookLM session from env var
@@ -82,6 +194,63 @@ def notify(msg: str):
         )
     except Exception as e:
         log(f"Telegram notify failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Gemini: generate per-post bridge document
+# ---------------------------------------------------------------------------
+
+def generate_bridge_doc(post_title: str, post_text: str) -> str:
+    """
+    Calls Gemini Flash to produce a short document connecting this blog post
+    to 1-2 specific Bright Kids AI tools. Returns empty string on any failure.
+    """
+    if not GEMINI_API_KEY:
+        log("    No GEMINI_API_KEY -- skipping bridge doc.")
+        return ""
+
+    try:
+        import google.generativeai as genai  # type: ignore
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        prompt = f"""\
+You are helping create context for a NotebookLM video about a Bright Kids AI blog post.
+
+The blog post is titled: "{post_title}"
+
+Here is an excerpt from the post (first 1500 characters):
+---
+{post_text[:1500]}
+---
+
+Bright Kids AI offers these tools for families of neurodiverse children:
+- My Stars: visual emotional check-in using four Star States (Sleepy Star, Bright Star, Zoom Star, Big Boom)
+- Weekly Brief: pattern view of check-ins over 7 days, helps parents spot emotional triggers
+- Personalized Stories: AI-generated storybooks where the child is the main character
+- Personalized Songs: original songs using the child's name and interests as transition anchors
+- Jenny: a conversational parenting guide inside the app (short, warm responses for parents)
+- Child Profile: built with Sunny, drives all personalization (name, age, reading level, interests, favorite toy)
+
+Write a 150-200 word document (not a list, flowing prose) from a parent's perspective that explains:
+1. Which 1-2 of the above tools most naturally connect to what this blog post covers, and why
+2. How a parent would realistically use that tool alongside the strategies in this post during an actual week
+
+Rules:
+- Do not pitch or sell. Write as if describing what another parent already does.
+- Only reference tools that genuinely connect to the post topic. If none connect naturally, say so briefly and return only that sentence.
+- Do not mention prices, subscriptions, or calls to action.
+- Keep it under 200 words.
+"""
+
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        log(f"    Bridge doc generated ({len(text)} chars).")
+        return text
+
+    except Exception as e:
+        log(f"    Bridge doc generation failed (non-fatal): {e}")
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -191,12 +360,10 @@ async def process_queued_jobs():
                 nb_id     = nb.id
                 log(f"    Notebook created: {nb_id}")
 
-                # Add source -- always use stored text content first (avoids 404 risk).
-                # Text content is already in Supabase from when the job was queued.
-                # URL is added as a second source only if text is short/missing.
+                # Source 1: blog post text (primary)
                 if post_text and len(post_text.strip()) > 100:
                     await client.sources.add_text(nb_id, post_title, post_text, wait=True)
-                    log(f"    Text indexed ({len(post_text)} chars).")
+                    log(f"    Blog text indexed ({len(post_text)} chars).")
                     # Also add URL as supplementary source if available
                     if post_url:
                         try:
@@ -209,6 +376,32 @@ async def process_queued_jobs():
                     log(f"    URL indexed: {post_url}")
                 else:
                     raise ValueError("No source content (no text or URL).")
+
+                # Source 2: static BK ecosystem overview (added to every notebook)
+                try:
+                    await client.sources.add_text(
+                        nb_id,
+                        "Bright Kids AI — Tools Families Are Using",
+                        BK_ECOSYSTEM_CONTEXT,
+                        wait=True,
+                    )
+                    log(f"    Ecosystem context indexed.")
+                except Exception as eco_err:
+                    log(f"    Ecosystem source skipped (non-fatal): {eco_err}")
+
+                # Source 3: Gemini-generated bridge connecting this post to BK tools
+                bridge_text = generate_bridge_doc(post_title, post_text)
+                if bridge_text:
+                    try:
+                        await client.sources.add_text(
+                            nb_id,
+                            f"How '{post_title[:50]}' Connects to Bright Kids AI",
+                            bridge_text,
+                            wait=True,
+                        )
+                        log(f"    Bridge doc indexed.")
+                    except Exception as bridge_err:
+                        log(f"    Bridge source skipped (non-fatal): {bridge_err}")
 
                 # Fire video generation (standard Video Overview -- works with Pro)
                 status  = await client.artifacts.generate_video(
