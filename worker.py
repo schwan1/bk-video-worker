@@ -191,15 +191,24 @@ async def process_queued_jobs():
                 nb_id     = nb.id
                 log(f"    Notebook created: {nb_id}")
 
-                # Add source
-                if post_url:
+                # Add source -- always use stored text content first (avoids 404 risk).
+                # Text content is already in Supabase from when the job was queued.
+                # URL is added as a second source only if text is short/missing.
+                if post_text and len(post_text.strip()) > 100:
+                    await client.sources.add_text(nb_id, post_text, title=post_title, wait=True)
+                    log(f"    Text indexed ({len(post_text)} chars).")
+                    # Also add URL as supplementary source if available
+                    if post_url:
+                        try:
+                            await client.sources.add_url(nb_id, post_url, wait=True)
+                            log(f"    URL also indexed: {post_url}")
+                        except Exception as url_err:
+                            log(f"    URL index skipped (non-fatal): {url_err}")
+                elif post_url:
                     await client.sources.add_url(nb_id, post_url, wait=True)
                     log(f"    URL indexed: {post_url}")
-                elif post_text:
-                    await client.sources.add_text(nb_id, post_text, title=post_title, wait=True)
-                    log("    Text indexed.")
                 else:
-                    raise ValueError("No source content (no URL or text).")
+                    raise ValueError("No source content (no text or URL).")
 
                 # Fire cinematic video
                 status  = await client.artifacts.generate_cinematic_video(
