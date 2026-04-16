@@ -195,7 +195,7 @@ async def process_queued_jobs():
                 # Text content is already in Supabase from when the job was queued.
                 # URL is added as a second source only if text is short/missing.
                 if post_text and len(post_text.strip()) > 100:
-                    await client.sources.add_text(nb_id, post_text, title=post_title, wait=True)
+                    await client.sources.add_text(nb_id, post_title, post_text, wait=True)
                     log(f"    Text indexed ({len(post_text)} chars).")
                     # Also add URL as supplementary source if available
                     if post_url:
