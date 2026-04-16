@@ -225,7 +225,8 @@ async def process_queued_jobs():
                     "updated_at":  now_iso(),
                 })
 
-                notify(f"BK video started 🎬\n'{post_title}'\nChecking every 5 min...")
+                nb_url = f"https://notebooklm.google.com/notebook/{nb_id}"
+                notify(f"BK video started 🎬\n'{post_title}'\nWatch progress in Studio:\n{nb_url}\nChecking every 5 min...")
 
             except Exception as e:
                 log(f"    FAILED: {e}")
