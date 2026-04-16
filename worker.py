@@ -242,6 +242,36 @@ async def process_queued_jobs():
 # Phase 2: check in-flight jobs (processing + notebook_id set)
 # ---------------------------------------------------------------------------
 
+def _poll_video_statuses(jobs: list, cookies: list) -> dict:
+    """
+    Synchronous helper (runs in executor thread).
+    Uses notebooklm_tools.poll_studio_status to check each notebook.
+    Returns dict keyed by notebook_id:
+      - None               -> still in_progress
+      - {"video_url": ...} -> completed, ready to download
+      - {"_error": ...}    -> poll failed
+    """
+    from notebooklm_tools.core.client import NotebookLMClient as NLMToolsClient  # type: ignore
+
+    results: dict = {}
+    with NLMToolsClient(cookies=cookies) as client:
+        for job in jobs:
+            nb_id = job["notebook_id"]
+            try:
+                artifacts = client.poll_studio_status(nb_id)
+                video = next(
+                    (a for a in artifacts
+                     if a.get("type") == "video"
+                     and a.get("status") == "completed"
+                     and a.get("video_url")),
+                    None,
+                )
+                results[nb_id] = video  # None means still in progress
+            except Exception as e:
+                results[nb_id] = {"_error": str(e)}
+    return results
+
+
 async def check_processing_jobs():
     # Fetch jobs that are processing and have a notebook_id (i.e., video was fired)
     jobs = supa_get("video_jobs", {
@@ -258,57 +288,86 @@ async def check_processing_jobs():
     log(f"Checking {len(jobs)} in-flight job(s)...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    from notebooklm import NotebookLMClient  # type: ignore
+    # Load Playwright cookies from the bootstrapped storage_state.json
+    storage_state = json.loads(STORAGE_PATH.read_text())
+    cookies = storage_state.get("cookies", [])
 
-    async with await NotebookLMClient.from_storage() as client:
-        for job in jobs:
-            job_id  = job["id"]
-            nb_id   = job["notebook_id"]
-            title   = job.get("blog_post_title", "Untitled")
-            out_path = str(OUTPUT_DIR / f"{job_id}.mp4")
+    # Poll all notebooks in one sync session (avoids repeated CSRF refresh overhead)
+    try:
+        statuses = await asyncio.get_event_loop().run_in_executor(
+            None, _poll_video_statuses, jobs, cookies
+        )
+    except Exception as e:
+        log(f"  ERROR polling NotebookLM: {e}")
+        return
 
-            log(f"  Checking '{title}' (job {job_id[:8]})...")
+    for job in jobs:
+        job_id   = job["id"]
+        nb_id    = job["notebook_id"]
+        title    = job.get("blog_post_title", "Untitled")
+        out_path = str(OUTPUT_DIR / f"{job_id}.mp4")
 
-            try:
-                await client.artifacts.download_video(nb_id, out_path)
-                log(f"    Downloaded: {out_path}")
+        log(f"  Checking '{title}' (job {job_id[:8]})...")
 
-                # Upload to Supabase Storage
-                video_url = supabase_upload_video(out_path, job_id)
-                log(f"    Uploaded to Supabase Storage: {video_url}")
+        artifact = statuses.get(nb_id)
 
-                supa_patch("video_jobs", {"id": job_id}, {
-                    "status":     "done",
-                    "video_url":  video_url,
-                    "video_path": out_path,
-                    "updated_at": now_iso(),
-                })
+        if artifact is None:
+            log(f"    Still processing -- will check again next run.")
+            continue
 
-                # Clean up local file
-                Path(out_path).unlink(missing_ok=True)
+        if "_error" in artifact:
+            err = artifact["_error"]
+            log(f"    FAILED to poll status: {err}")
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":        "failed",
+                "error_message": err[:500],
+                "updated_at":    now_iso(),
+            })
+            notify(f"BK video FAILED (poll error): '{title}'\n{err[:120]}")
+            continue
 
-                notify(
-                    f"BK video ready! 🎬\n"
-                    f"'{title}'\n"
-                    f"Open in admin → Blog → click the red YouTube icon"
-                )
+        # Video is complete -- download the signed CDN URL (no auth needed)
+        video_cdn_url = artifact["video_url"]
+        log(f"    Video completed! Downloading from CDN...")
 
-            except Exception as e:
-                err = str(e).lower()
-                still_running = any(x in err for x in [
-                    "not found", "no completed", "null result",
-                    "processing", "in progress", "pending", "generating",
-                ])
-                if still_running:
-                    log(f"    Still processing -- will check again next run.")
-                else:
-                    log(f"    FAILED: {e}")
-                    supa_patch("video_jobs", {"id": job_id}, {
-                        "status":        "failed",
-                        "error_message": str(e)[:500],
-                        "updated_at":    now_iso(),
-                    })
-                    notify(f"BK video FAILED: '{title}'\n{str(e)[:120]}")
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as http:
+                async with http.stream("GET", video_cdn_url) as resp:
+                    resp.raise_for_status()
+                    with open(out_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            f.write(chunk)
+
+            log(f"    Downloaded: {out_path}")
+
+            # Upload to Supabase Storage
+            video_url = supabase_upload_video(out_path, job_id)
+            log(f"    Uploaded to Supabase Storage: {video_url}")
+
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":     "done",
+                "video_url":  video_url,
+                "video_path": out_path,
+                "updated_at": now_iso(),
+            })
+
+            # Clean up local file
+            Path(out_path).unlink(missing_ok=True)
+
+            notify(
+                f"BK video ready! 🎬\n"
+                f"'{title}'\n"
+                f"Open in admin → Blog → click the red YouTube icon"
+            )
+
+        except Exception as e:
+            log(f"    FAILED to download/upload: {e}")
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":        "failed",
+                "error_message": str(e)[:500],
+                "updated_at":    now_iso(),
+            })
+            notify(f"BK video FAILED: '{title}'\n{str(e)[:120]}")
 
 
 # ---------------------------------------------------------------------------
