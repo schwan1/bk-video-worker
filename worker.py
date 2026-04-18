@@ -306,7 +306,7 @@ def supabase_upload_video(local_path: str, job_id: str) -> str:
                 "x-upsert": "true",
             },
             content=f.read(),
-            timeout=120,
+            timeout=300,
         )
         r.raise_for_status()
 
@@ -519,19 +519,38 @@ async def check_processing_jobs():
             notify(f"BK video FAILED (poll error): '{title}'\n{err[:120]}")
             continue
 
-        # Video is complete -- download the signed CDN URL (no auth needed)
+        # Video is complete -- download using Google session cookies so the CDN
+        # serves the actual MP4 rather than an auth redirect page.
         video_cdn_url = artifact["video_url"]
         log(f"    Video completed! Downloading from CDN...")
 
+        # Build httpx cookie jar from Playwright storage_state cookies
+        cookie_jar = httpx.Cookies()
+        for ck in cookies:
+            try:
+                cookie_jar.set(ck["name"], ck["value"], domain=ck.get("domain", ""))
+            except Exception:
+                pass
+
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as http:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=300,
+                cookies=cookie_jar,
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as http:
                 async with http.stream("GET", video_cdn_url) as resp:
                     resp.raise_for_status()
                     with open(out_path, "wb") as f:
                         async for chunk in resp.aiter_bytes(65536):
                             f.write(chunk)
 
-            log(f"    Downloaded: {out_path}")
+            file_size = Path(out_path).stat().st_size
+            log(f"    Downloaded: {out_path} ({file_size / 1_048_576:.1f} MB)")
+            if file_size < 1_000_000:
+                raise ValueError(
+                    f"Downloaded file is only {file_size} bytes -- likely an auth redirect, not a real video."
+                )
 
             # Upload to Supabase Storage
             video_url = supabase_upload_video(out_path, job_id)
