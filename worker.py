@@ -20,7 +20,6 @@ import asyncio
 import base64
 import json
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -452,14 +451,23 @@ def _poll_video_statuses(jobs: list, cookies: list) -> dict:
             nb_id = job["notebook_id"]
             try:
                 artifacts = client.poll_studio_status(nb_id)
-                video = next(
+                completed = next(
                     (a for a in artifacts
                      if a.get("type") == "video"
                      and a.get("status") == "completed"
                      and a.get("video_url")),
                     None,
                 )
-                results[nb_id] = video  # None means still in progress
+                if completed:
+                    results[nb_id] = completed
+                else:
+                    nlm_failed = next(
+                        (a for a in artifacts
+                         if a.get("type") == "video"
+                         and a.get("status") == "failed"),
+                        None,
+                    )
+                    results[nb_id] = {"_nlm_failed": True} if nlm_failed else None
             except Exception as e:
                 results[nb_id] = {"_error": str(e)}
     return results
@@ -506,6 +514,18 @@ async def check_processing_jobs():
 
         if artifact is None:
             log(f"    Still processing -- will check again next run.")
+            continue
+
+        if "_nlm_failed" in artifact:
+            log(f"    NotebookLM video generation FAILED -- resetting to queued for retry.")
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":        "queued",
+                "notebook_id":   None,
+                "task_id":       None,
+                "error_message": "NotebookLM video generation failed -- retrying with new notebook",
+                "updated_at":    now_iso(),
+            })
+            notify(f"BK video gen failed in NLM, retrying: '{title}'")
             continue
 
         if "_error" in artifact:
