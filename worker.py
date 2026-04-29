@@ -225,9 +225,8 @@ def generate_bridge_doc(post_title: str, post_text: str) -> str:
         return ""
 
     try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        from google import genai  # type: ignore
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
         prompt = f"""\
 You are helping create context for a NotebookLM video about a Bright Kids AI blog post.
@@ -258,7 +257,7 @@ Rules:
 - Keep it under 200 words.
 """
 
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         text = response.text.strip()
         log(f"    Bridge doc generated ({len(text)} chars).")
         return text
@@ -395,9 +394,8 @@ def generate_video_description(title: str, post_text: str) -> str:
         return f"{title}\n\n{DESCRIPTION_FALLBACK}"
 
     try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        from google import genai  # type: ignore
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
         prompt = f"""\
 Write a YouTube video description for a Bright Kids AI video about this blog post.
@@ -434,7 +432,7 @@ Bright Kids AI creates personalized storybooks, songs, and learning tools for ne
 Rules: under 500 words, tone empathetic and empowering for parents of neurodiverse children.
 """
 
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         desc = response.text.strip()
         log(f"    Description generated ({len(desc)} chars).")
         return desc
