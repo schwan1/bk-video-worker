@@ -257,7 +257,7 @@ Rules:
 - Keep it under 200 words.
 """
 
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
         text = response.text.strip()
         log(f"    Bridge doc generated ({len(text)} chars).")
         return text
@@ -432,7 +432,7 @@ Bright Kids AI creates personalized storybooks, songs, and learning tools for ne
 Rules: under 500 words, tone empathetic and empowering for parents of neurodiverse children.
 """
 
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
         desc = response.text.strip()
         log(f"    Description generated ({len(desc)} chars).")
         return desc
