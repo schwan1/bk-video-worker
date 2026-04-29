@@ -275,36 +275,77 @@ Rules:
 def append_outro(video_path: str, job_id: str) -> str:
     """
     Download BK outro card from BK_OUTRO_URL and concatenate with main video.
-    Returns branded output path, or original path if outro unavailable.
+    Accepts either a PNG image URL (converted on-the-fly to a 5-sec silent MP4)
+    or a direct MP4 URL. Returns branded output path, or original if unavailable.
     """
     if not BK_OUTRO_URL:
         log("    BK_OUTRO_URL not set -- skipping outro.")
         return video_path
 
-    outro_path  = str(OUTPUT_DIR / "bk_outro.mp4")
-    branded_path = str(OUTPUT_DIR / f"{job_id}_branded.mp4")
-    concat_list  = str(OUTPUT_DIR / f"{job_id}_concat.txt")
+    import subprocess
 
-    # Download outro once per worker run (cached for subsequent jobs)
+    outro_path   = str(OUTPUT_DIR / "bk_outro.mp4")
+    branded_path = str(OUTPUT_DIR / f"{job_id}_branded.mp4")
+
+    # Build outro MP4 once per container run (cached for subsequent jobs)
     if not Path(outro_path).exists():
         try:
-            log("    Downloading BK outro card...")
+            log("    Downloading BK outro asset...")
             r = httpx.get(BK_OUTRO_URL, timeout=60, follow_redirects=True)
             r.raise_for_status()
-            Path(outro_path).write_bytes(r.content)
-            log(f"    Outro cached ({len(r.content) / 1024:.0f} KB).")
+
+            content_type = r.headers.get("content-type", "")
+            is_image = "image" in content_type or BK_OUTRO_URL.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp")
+            )
+
+            if is_image:
+                png_path = str(OUTPUT_DIR / "bk_outro_card.png")
+                Path(png_path).write_bytes(r.content)
+                log("    Converting outro PNG → 5-sec silent MP4...")
+                conv = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-loop", "1", "-i", png_path,
+                        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", "5",
+                        "-c:v", "libx264", "-c:a", "aac",
+                        "-pix_fmt", "yuv420p",
+                        "-vf", (
+                            "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+                        ),
+                        "-shortest", outro_path,
+                    ],
+                    capture_output=True, text=True, timeout=60,
+                )
+                Path(png_path).unlink(missing_ok=True)
+                if conv.returncode != 0:
+                    log(f"    Outro PNG→MP4 conversion failed (non-fatal): {conv.stderr[:300]}")
+                    return video_path
+                log("    Outro card converted to MP4 and cached.")
+            else:
+                Path(outro_path).write_bytes(r.content)
+                log(f"    Outro MP4 cached ({len(r.content) / 1024:.0f} KB).")
+
         except Exception as e:
-            log(f"    Outro download failed (non-fatal): {e}")
+            log(f"    Outro download/convert failed (non-fatal): {e}")
             return video_path
 
-    Path(concat_list).write_text(f"file '{video_path}'\nfile '{outro_path}'\n")
-
+    # Concatenate using filter_complex so codec/resolution differences are handled
     try:
-        import subprocess
         result = subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
-             "-c", "copy", branded_path],
-            capture_output=True, text=True, timeout=180,
+            [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", outro_path,
+                "-filter_complex",
+                "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+                "-map", "[outv]", "-map", "[outa]",
+                "-c:v", "libx264", "-c:a", "aac",
+                branded_path,
+            ],
+            capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0 and Path(branded_path).exists():
             log(f"    Outro appended: {branded_path}")
@@ -315,8 +356,6 @@ def append_outro(video_path: str, job_id: str) -> str:
     except Exception as e:
         log(f"    Outro append error (non-fatal): {e}")
         return video_path
-    finally:
-        Path(concat_list).unlink(missing_ok=True)
 
 
 def create_thumbnail(video_path: str, job_id: str) -> str | None:
