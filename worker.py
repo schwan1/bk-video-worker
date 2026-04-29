@@ -34,8 +34,11 @@ TG_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID       = os.environ.get("TELEGRAM_CHAT_ID", "")
 SESSION_B64      = os.environ.get("NOTEBOOKLM_STORAGE_STATE_B64", "")
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+YOUTUBE_TOKEN_B64 = os.environ.get("YOUTUBE_TOKEN_B64", "")
+BK_OUTRO_URL     = os.environ.get("BK_OUTRO_URL", "")  # Supabase Storage URL for 5-sec outro card
 OUTPUT_DIR       = Path("/tmp/bk_videos")
 STORAGE_PATH     = Path("/root/.notebooklm/storage_state.json")
+YOUTUBE_TOKEN_PATH = Path("/root/.config/youtube/token.json")
 
 VIDEO_INSTRUCTION = (
     "Create an engaging, warm cinematic overview for parents of neurodiverse children. "
@@ -172,6 +175,15 @@ def bootstrap_session():
     log(f"NotebookLM session written to {STORAGE_PATH}")
 
 
+def bootstrap_youtube():
+    if not YOUTUBE_TOKEN_B64:
+        log("YOUTUBE_TOKEN_B64 not set -- YouTube upload will be skipped.")
+        return
+    YOUTUBE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    YOUTUBE_TOKEN_PATH.write_text(base64.b64decode(YOUTUBE_TOKEN_B64).decode("utf-8"))
+    log(f"YouTube token written to {YOUTUBE_TOKEN_PATH}")
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -254,6 +266,235 @@ Rules:
     except Exception as e:
         log(f"    Bridge doc generation failed (non-fatal): {e}")
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: outro, thumbnail, description, YouTube upload
+# ---------------------------------------------------------------------------
+
+def append_outro(video_path: str, job_id: str) -> str:
+    """
+    Download BK outro card from BK_OUTRO_URL and concatenate with main video.
+    Returns branded output path, or original path if outro unavailable.
+    """
+    if not BK_OUTRO_URL:
+        log("    BK_OUTRO_URL not set -- skipping outro.")
+        return video_path
+
+    outro_path  = str(OUTPUT_DIR / "bk_outro.mp4")
+    branded_path = str(OUTPUT_DIR / f"{job_id}_branded.mp4")
+    concat_list  = str(OUTPUT_DIR / f"{job_id}_concat.txt")
+
+    # Download outro once per worker run (cached for subsequent jobs)
+    if not Path(outro_path).exists():
+        try:
+            log("    Downloading BK outro card...")
+            r = httpx.get(BK_OUTRO_URL, timeout=60, follow_redirects=True)
+            r.raise_for_status()
+            Path(outro_path).write_bytes(r.content)
+            log(f"    Outro cached ({len(r.content) / 1024:.0f} KB).")
+        except Exception as e:
+            log(f"    Outro download failed (non-fatal): {e}")
+            return video_path
+
+    Path(concat_list).write_text(f"file '{video_path}'\nfile '{outro_path}'\n")
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+             "-c", "copy", branded_path],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode == 0 and Path(branded_path).exists():
+            log(f"    Outro appended: {branded_path}")
+            return branded_path
+        else:
+            log(f"    Outro append failed (non-fatal): {result.stderr[:300]}")
+            return video_path
+    except Exception as e:
+        log(f"    Outro append error (non-fatal): {e}")
+        return video_path
+    finally:
+        Path(concat_list).unlink(missing_ok=True)
+
+
+def create_thumbnail(video_path: str, job_id: str) -> str | None:
+    """Extract first frame as 1280x720 JPEG thumbnail using ffmpeg."""
+    thumb_path = str(OUTPUT_DIR / f"{job_id}_thumb.jpg")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-ss", "0.0", "-i", video_path,
+             "-vframes", "1", "-s", "1280x720", "-q:v", "2", thumb_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and Path(thumb_path).exists():
+            log(f"    Thumbnail created: {thumb_path}")
+            return thumb_path
+        else:
+            log(f"    Thumbnail failed (non-fatal): {result.stderr[:200]}")
+            return None
+    except Exception as e:
+        log(f"    Thumbnail error (non-fatal): {e}")
+        return None
+
+
+DESCRIPTION_FALLBACK = (
+    "Bright Kids AI creates personalized storybooks, songs, and learning tools "
+    "for neurodiverse children.\n\n"
+    "🔗 Learn more: https://brightkidsai.com\n"
+    "📧 Get free resources: https://brightkidsai.com/subscribe\n\n"
+    "#Neurodiversity #ADHD #Autism #NeurodiverseParenting #BrightKidsAI"
+)
+
+
+def generate_video_description(title: str, post_text: str) -> str:
+    """Use Gemini to create a YouTube description from blog post content."""
+    if not GEMINI_API_KEY:
+        log("    No GEMINI_API_KEY -- using fallback description.")
+        return f"{title}\n\n{DESCRIPTION_FALLBACK}"
+
+    try:
+        import google.generativeai as genai  # type: ignore
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        prompt = f"""\
+Write a YouTube video description for a Bright Kids AI video about this blog post.
+
+Title: "{title}"
+
+Blog post excerpt:
+---
+{post_text[:2000]}
+---
+
+Format EXACTLY as follows (no extra commentary):
+
+[2-3 sentence warm summary of the video's main message]
+
+---
+
+In this video, we explore [topic 1], [topic 2], and [topic 3].
+
+Key Takeaways:
+• [Actionable insight 1]
+• [Actionable insight 2]
+• [Actionable insight 3]
+
+---
+
+Bright Kids AI creates personalized storybooks, songs, and learning tools for neurodiverse children.
+
+🔗 Learn more: https://brightkidsai.com
+📧 Get free resources: https://brightkidsai.com/subscribe
+
+#Neurodiversity #ADHD #Autism #NeurodiverseParenting #BrightKidsAI
+
+Rules: under 500 words, tone empathetic and empowering for parents of neurodiverse children.
+"""
+
+        response = model.generate_content(prompt)
+        desc = response.text.strip()
+        log(f"    Description generated ({len(desc)} chars).")
+        return desc
+
+    except Exception as e:
+        log(f"    Description generation failed (non-fatal): {e}")
+        return f"{title}\n\n{DESCRIPTION_FALLBACK}"
+
+
+def upload_to_youtube(
+    video_path: str,
+    thumbnail_path: str | None,
+    title: str,
+    description: str,
+) -> str | None:
+    """
+    Upload video to YouTube using stored OAuth token.
+    Returns YouTube video ID, or None if upload is skipped/failed.
+    """
+    if not YOUTUBE_TOKEN_B64:
+        log("    YOUTUBE_TOKEN_B64 not set -- skipping YouTube upload.")
+        return None
+
+    if not YOUTUBE_TOKEN_PATH.exists():
+        log("    YouTube token file missing -- skipping YouTube upload.")
+        return None
+
+    try:
+        import subprocess
+        from googleapiclient.discovery import build           # type: ignore
+        from googleapiclient.http import MediaFileUpload      # type: ignore
+        from google.oauth2.credentials import Credentials     # type: ignore
+        from google.auth.transport.requests import Request    # type: ignore
+
+        creds_data = json.loads(YOUTUBE_TOKEN_PATH.read_text())
+        creds = Credentials(
+            token=creds_data.get("token"),
+            refresh_token=creds_data.get("refresh_token"),
+            token_uri=creds_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=creds_data.get("client_id"),
+            client_secret=creds_data.get("client_secret"),
+            scopes=creds_data.get("scopes", ["https://www.googleapis.com/auth/youtube.upload"]),
+        )
+
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Persist refreshed token so next run doesn't need re-auth
+            updated = {**creds_data, "token": creds.token}
+            YOUTUBE_TOKEN_PATH.write_text(json.dumps(updated))
+            log("    YouTube token refreshed and saved.")
+
+        youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+        body = {
+            "snippet": {
+                "title": title,
+                "description": description,
+                "tags": ["Neurodiversity", "ADHD", "Autism", "Parenting", "Special Education",
+                         "BrightKidsAI", "Neurodiverse Children"],
+                "categoryId": "26",  # Howto & Style
+                "defaultLanguage": "en",
+            },
+            "status": {
+                "privacyStatus": "unlisted",
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+
+        media = MediaFileUpload(
+            video_path, mimetype="video/mp4",
+            resumable=True, chunksize=10 * 1024 * 1024,
+        )
+        insert_request = youtube.videos().insert(
+            part="snippet,status", body=body, media_body=media,
+        )
+
+        response = None
+        while response is None:
+            status, response = insert_request.next_chunk()
+            if status:
+                log(f"    Upload progress: {int(status.progress() * 100)}%")
+
+        video_id = response["id"]
+        log(f"    YouTube upload complete: https://youtu.be/{video_id}")
+
+        # Upload custom thumbnail (first frame = title card)
+        if thumbnail_path and Path(thumbnail_path).exists():
+            try:
+                thumb_media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+                youtube.thumbnails().set(videoId=video_id, media_body=thumb_media).execute()
+                log(f"    Thumbnail uploaded for {video_id}.")
+            except Exception as thumb_err:
+                log(f"    Thumbnail upload failed (non-fatal): {thumb_err}")
+
+        return video_id
+
+    except Exception as e:
+        log(f"    YouTube upload FAILED: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -576,25 +817,52 @@ async def check_processing_jobs():
                     f"Downloaded file is only {file_size} bytes -- likely an auth redirect, not a real video."
                 )
 
-            # Upload to Supabase Storage
-            video_url = supabase_upload_video(out_path, job_id)
-            log(f"    Uploaded to Supabase Storage: {video_url}")
+            # ── Step 1: Append BK outro card ────────────────────────────
+            branded_path = append_outro(out_path, job_id)
 
+            # ── Step 2: Extract first-frame thumbnail ────────────────────
+            thumb_path = create_thumbnail(branded_path, job_id)
+
+            # ── Step 3: Upload branded video to Supabase Storage ────────
+            storage_url = supabase_upload_video(branded_path, job_id)
+            log(f"    Uploaded to Supabase Storage: {storage_url}")
+
+            # ── Step 4: Generate Gemini description ─────────────────────
+            post_text_for_desc = job.get("blog_post_content", "")
+            description = generate_video_description(title, post_text_for_desc)
+
+            # ── Step 5: Upload to YouTube ────────────────────────────────
+            yt_video_id = upload_to_youtube(branded_path, thumb_path, title, description)
+
+            # ── Step 6: Update database ──────────────────────────────────
+            final_url = f"https://youtu.be/{yt_video_id}" if yt_video_id else storage_url
             supa_patch("video_jobs", {"id": job_id}, {
                 "status":     "done",
-                "video_url":  video_url,
-                "video_path": out_path,
+                "video_url":  final_url,
+                "video_path": branded_path,
                 "updated_at": now_iso(),
             })
 
-            # Clean up local file
+            # ── Step 7: Cleanup local files ──────────────────────────────
             Path(out_path).unlink(missing_ok=True)
+            if branded_path != out_path:
+                Path(branded_path).unlink(missing_ok=True)
+            if thumb_path:
+                Path(thumb_path).unlink(missing_ok=True)
 
-            notify(
-                f"BK video ready! 🎬\n"
-                f"'{title}'\n"
-                f"Open in admin → Blog → click the red YouTube icon"
-            )
+            if yt_video_id:
+                notify(
+                    f"BK video live on YouTube! 🎬\n"
+                    f"'{title}'\n"
+                    f"https://youtu.be/{yt_video_id}"
+                )
+            else:
+                notify(
+                    f"BK video ready (Supabase Storage) 🎬\n"
+                    f"'{title}'\n"
+                    f"{storage_url}\n"
+                    f"(Set YOUTUBE_TOKEN_B64 in Railway to enable auto-upload)"
+                )
 
         except Exception as e:
             log(f"    FAILED to download/upload: {e}")
@@ -615,6 +883,7 @@ async def main():
     log("BK Video Worker (Railway) -- start")
 
     bootstrap_session()
+    bootstrap_youtube()
 
     await process_queued_jobs()
     await check_processing_jobs()
