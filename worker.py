@@ -44,7 +44,11 @@ VIDEO_INSTRUCTION = (
     "The third source describes the Bright Kids AI tools that families are already using. "
     "Where it fits naturally -- not as a pitch, but as a 'families are finding this helps' moment -- "
     "name one or two of those tools by name and show how they connect to what this article covers. "
-    "If a connection does not feel genuine, leave it out entirely."
+    "If a connection does not feel genuine, leave it out entirely. "
+    "CRITICAL TEXT REQUIREMENT: Every text overlay, caption, callout bubble, label, and on-screen "
+    "graphic must contain clear, complete, fully-visible text. Never leave a text field, speech "
+    "bubble, or placeholder empty or blank. If a visual element is shown, it must display "
+    "readable, meaningful text that is relevant to the narration at that moment."
 )
 
 # ---------------------------------------------------------------------------
