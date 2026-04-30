@@ -324,8 +324,11 @@ class OutroAppendError(Exception):
 def build_outro_card() -> tuple[bool, str]:
     """
     Download the outro asset from BK_OUTRO_URL and build a 5-second 1280x720
-    silent MP4 once per container run. Called at worker startup so any URL or
-    ffmpeg problems surface immediately, not buried inside a video job.
+    silent MP4. Called at worker startup so any URL or ffmpeg problems surface
+    immediately. ALWAYS rebuilds (does not trust the cache) because:
+    - Railway's /tmp can persist between container restarts in some cases
+    - The user may have replaced the source PNG at the same URL (same path,
+      new content), so the cache filename alone can't tell us if it's stale
 
     Returns (success, message). Message is printable detail for diagnostics.
     """
@@ -336,8 +339,8 @@ def build_outro_card() -> tuple[bool, str]:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if OUTRO_PATH.exists() and OUTRO_PATH.stat().st_size > 1000:
-        return True, f"Already cached ({OUTRO_PATH.stat().st_size // 1024} KB)"
+    # Always start fresh so the outro reflects the current source image
+    OUTRO_PATH.unlink(missing_ok=True)
 
     try:
         r = httpx.get(BK_OUTRO_URL, timeout=60, follow_redirects=True)
@@ -411,18 +414,33 @@ def append_outro(video_path: str, job_id: str) -> str:
 
     branded_path = str(OUTPUT_DIR / f"{job_id}_branded.mp4")
 
+    # Explicitly normalize BOTH inputs to identical dimensions / pixel format /
+    # framerate / audio sample rate before concatenating. The previous concat
+    # was failing with libx264 error -22 because the cached outro was built at
+    # a different resolution than the NotebookLM video. Forcing both streams
+    # through the same scale+format+fps pipeline guarantees they match.
+    filter_graph = (
+        "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v0];"
+        "[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0];"
+        "[1:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1];"
+        "[1:a]aformat=sample_rates=44100:channel_layouts=stereo[a1];"
+        "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]"
+    )
+
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", video_path,
                 "-i", str(OUTRO_PATH),
-                "-filter_complex",
-                "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[outv][outa]",
+                "-filter_complex", filter_graph,
                 "-map", "[outv]", "-map", "[outa]",
                 "-c:v", "libx264", "-preset", "ultrafast",
                 "-c:a", "aac", "-ar", "44100",
                 "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 branded_path,
             ],
             capture_output=True, text=True, timeout=900,  # 15 min ceiling
@@ -433,7 +451,7 @@ def append_outro(video_path: str, job_id: str) -> str:
         raise OutroAppendError(f"Concat ffmpeg crashed: {e}")
 
     if result.returncode != 0 or not Path(branded_path).exists():
-        raise OutroAppendError(f"Concat ffmpeg failed (rc={result.returncode}): {result.stderr[-400:]}")
+        raise OutroAppendError(f"Concat ffmpeg failed (rc={result.returncode}): {result.stderr[-500:]}")
 
     log(f"    Outro appended: {branded_path}")
     return branded_path
