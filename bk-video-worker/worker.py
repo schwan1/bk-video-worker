@@ -28,17 +28,30 @@ import httpx
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SUPABASE_URL     = os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY     = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-TG_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID       = os.environ.get("TELEGRAM_CHAT_ID", "")
-SESSION_B64      = os.environ.get("NOTEBOOKLM_STORAGE_STATE_B64", "")
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-YOUTUBE_TOKEN_B64 = os.environ.get("YOUTUBE_TOKEN_B64", "")
-BK_OUTRO_URL     = os.environ.get("BK_OUTRO_URL", "")  # Supabase Storage URL for 5-sec outro card
+def _envstr(name: str) -> str:
+    """Read env var and strip surrounding whitespace/newlines (Railway sometimes adds them)."""
+    return os.environ.get(name, "").strip()
+
+SUPABASE_URL     = _envstr("NEXT_PUBLIC_SUPABASE_URL").rstrip("/")
+SUPABASE_KEY     = _envstr("SUPABASE_SERVICE_ROLE_KEY")
+TG_TOKEN         = _envstr("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID       = _envstr("TELEGRAM_CHAT_ID")
+SESSION_B64      = _envstr("NOTEBOOKLM_STORAGE_STATE_B64")
+GEMINI_API_KEY   = _envstr("GEMINI_API_KEY")
+YOUTUBE_TOKEN_B64 = _envstr("YOUTUBE_TOKEN_B64")
+BK_OUTRO_URL     = _envstr("BK_OUTRO_URL")  # Supabase Storage URL for 5-sec outro card
 OUTPUT_DIR       = Path("/tmp/bk_videos")
 STORAGE_PATH     = Path("/root/.notebooklm/storage_state.json")
 YOUTUBE_TOKEN_PATH = Path("/root/.config/youtube/token.json")
+
+# Try these Gemini models in order until one succeeds (model availability varies by API key)
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.0-flash-001",
+    "gemini-1.5-flash-002",
+    "gemini-1.5-flash",
+]
 
 VIDEO_INSTRUCTION = (
     "Create an engaging, warm cinematic overview for parents of neurodiverse children. "
@@ -212,6 +225,30 @@ def notify(msg: str):
 
 
 # ---------------------------------------------------------------------------
+# Gemini: helper that tries multiple models until one works
+# ---------------------------------------------------------------------------
+
+def _gemini_generate(prompt: str) -> str:
+    """
+    Call Gemini using the new google-genai SDK, trying GEMINI_MODEL_FALLBACKS
+    in order. Returns generated text, or raises the last exception.
+    """
+    from google import genai  # type: ignore
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    last_err: Exception | None = None
+    for model in GEMINI_MODEL_FALLBACKS:
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+            log(f"    Gemini OK with model: {model}")
+            return response.text.strip()
+        except Exception as e:
+            last_err = e
+            log(f"    Gemini model {model} failed: {str(e)[:200]}")
+            continue
+    raise last_err if last_err else RuntimeError("All Gemini models failed")
+
+
+# ---------------------------------------------------------------------------
 # Gemini: generate per-post bridge document
 # ---------------------------------------------------------------------------
 
@@ -225,9 +262,6 @@ def generate_bridge_doc(post_title: str, post_text: str) -> str:
         return ""
 
     try:
-        from google import genai  # type: ignore
-        client = genai.Client(api_key=GEMINI_API_KEY)
-
         prompt = f"""\
 You are helping create context for a NotebookLM video about a Bright Kids AI blog post.
 
@@ -257,8 +291,7 @@ Rules:
 - Keep it under 200 words.
 """
 
-        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-        text = response.text.strip()
+        text = _gemini_generate(prompt)
         log(f"    Bridge doc generated ({len(text)} chars).")
         return text
 
@@ -394,9 +427,6 @@ def generate_video_description(title: str, post_text: str) -> str:
         return f"{title}\n\n{DESCRIPTION_FALLBACK}"
 
     try:
-        from google import genai  # type: ignore
-        client = genai.Client(api_key=GEMINI_API_KEY)
-
         prompt = f"""\
 Write a YouTube video description for a Bright Kids AI video about this blog post.
 
@@ -432,8 +462,7 @@ Bright Kids AI creates personalized storybooks, songs, and learning tools for ne
 Rules: under 500 words, tone empathetic and empowering for parents of neurodiverse children.
 """
 
-        response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-        desc = response.text.strip()
+        desc = _gemini_generate(prompt)
         log(f"    Description generated ({len(desc)} chars).")
         return desc
 
@@ -918,6 +947,14 @@ async def check_processing_jobs():
 async def main():
     log("=" * 55)
     log("BK Video Worker (Railway) -- start")
+
+    # Diagnostic: confirm which env vars actually reached the container
+    log(f"  ENV: SUPABASE_URL        = {'set (' + str(len(SUPABASE_URL)) + ' chars)' if SUPABASE_URL else 'MISSING'}")
+    log(f"  ENV: SUPABASE_KEY        = {'set' if SUPABASE_KEY else 'MISSING'}")
+    log(f"  ENV: GEMINI_API_KEY      = {'set' if GEMINI_API_KEY else 'MISSING'}")
+    log(f"  ENV: YOUTUBE_TOKEN_B64   = {'set' if YOUTUBE_TOKEN_B64 else 'MISSING'}")
+    log(f"  ENV: BK_OUTRO_URL        = {BK_OUTRO_URL[:60] + '...' if len(BK_OUTRO_URL) > 60 else (BK_OUTRO_URL or 'MISSING')}")
+    log(f"  ENV: SESSION_B64         = {'set' if SESSION_B64 else 'MISSING'}")
 
     bootstrap_session()
     bootstrap_youtube()
