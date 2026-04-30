@@ -972,7 +972,11 @@ async def check_processing_jobs():
         artifact = statuses.get(nb_id)
 
         if artifact is None:
-            log(f"    Still processing -- will check again next run.")
+            log(f"    Still processing -- will check again in 90 sec.")
+            # Refresh status_detail with a "last checked" timestamp so the admin
+            # UI shows the worker is actively polling, not stuck.
+            stamp = datetime.now().strftime("%H:%M:%S")
+            set_progress(job_id, f"NotebookLM still rendering (last checked {stamp})")
             continue
 
         if "_nlm_failed" in artifact:
