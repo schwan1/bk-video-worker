@@ -39,7 +39,11 @@ TG_CHAT_ID       = _envstr("TELEGRAM_CHAT_ID")
 SESSION_B64      = _envstr("NOTEBOOKLM_STORAGE_STATE_B64")
 GEMINI_API_KEY   = _envstr("GEMINI_API_KEY")
 YOUTUBE_TOKEN_B64 = _envstr("YOUTUBE_TOKEN_B64")
-BK_OUTRO_URL     = _envstr("BK_OUTRO_URL")  # Supabase Storage URL for 5-sec outro card
+# BK outro card -- fallback to known Supabase Storage URL if env var is empty.
+# This was added because Railway has occasionally failed to inject BK_OUTRO_URL
+# into the running container even though the variable is set in the dashboard.
+_BK_OUTRO_FALLBACK = "https://xcembolzsphaddfcinxc.supabase.co/storage/v1/object/public/assets/bk_outro_card.png"
+BK_OUTRO_URL     = _envstr("BK_OUTRO_URL") or _BK_OUTRO_FALLBACK
 OUTPUT_DIR       = Path("/tmp/bk_videos")
 STORAGE_PATH     = Path("/root/.notebooklm/storage_state.json")
 YOUTUBE_TOKEN_PATH = Path("/root/.config/youtube/token.json")
@@ -56,7 +60,11 @@ GEMINI_MODEL_FALLBACKS = [
 VIDEO_INSTRUCTION = (
     "Create an engaging, warm cinematic overview for parents of neurodiverse children. "
     "Tone: empathetic, clear, and reassuring. Focus on practical takeaways and specific benefits. "
-    "Brand: Bright Kids AI -- empowering every bright mind. "
+    "OPENING TITLE SLIDE: The very first slide must display the BLOG POST TITLE as the main, "
+    "prominent heading at the center of the frame. Add 'produced by Bright Kids AI' as a small "
+    "subtitle line below the title. Do NOT use 'Bright Kids AI' or the BK logo as the main title "
+    "of the opening slide -- the blog post title is always the headline; Bright Kids AI is only "
+    "the producer credit. "
     "The third source describes the Bright Kids AI tools that families are already using. "
     "Where it fits naturally -- not as a pitch, but as a 'families are finding this helps' moment -- "
     "name one or two of those tools by name and show how they connect to what this article covers. "
@@ -563,6 +571,67 @@ def upload_to_youtube(
         return None
 
 
+def _extract_youtube_id(url: str) -> str | None:
+    """Pull the YouTube video ID out of either youtu.be/ID or youtube.com/watch?v=ID."""
+    if not url:
+        return None
+    if "youtu.be/" in url:
+        return url.split("youtu.be/")[-1].split("?")[0].split("/")[0]
+    if "v=" in url:
+        return url.split("v=")[-1].split("&")[0]
+    return None
+
+
+def update_youtube_metadata(youtube_video_id: str, title: str, description: str) -> bool:
+    """
+    Update title + description on an existing YouTube video. Returns True on success.
+    Used by the metadata-only regeneration flow from the admin UI.
+    """
+    if not YOUTUBE_TOKEN_PATH.exists():
+        log("    YouTube token file missing -- cannot update metadata.")
+        return False
+
+    try:
+        from googleapiclient.discovery import build           # type: ignore
+        from google.oauth2.credentials import Credentials     # type: ignore
+        from google.auth.transport.requests import Request    # type: ignore
+
+        creds_data = json.loads(YOUTUBE_TOKEN_PATH.read_text())
+        creds = Credentials(
+            token=creds_data.get("token"),
+            refresh_token=creds_data.get("refresh_token"),
+            token_uri=creds_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=creds_data.get("client_id"),
+            client_secret=creds_data.get("client_secret"),
+            scopes=creds_data.get("scopes", ["https://www.googleapis.com/auth/youtube.upload"]),
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            YOUTUBE_TOKEN_PATH.write_text(json.dumps({**creds_data, "token": creds.token}))
+
+        youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+        # Must include categoryId on update -- YouTube rejects snippet without it.
+        body = {
+            "id": youtube_video_id,
+            "snippet": {
+                "title": title,
+                "description": description,
+                "categoryId": "26",
+                "tags": ["Neurodiversity", "ADHD", "Autism", "Parenting", "Special Education",
+                         "BrightKidsAI", "Neurodiverse Children"],
+                "defaultLanguage": "en",
+            },
+        }
+        youtube.videos().update(part="snippet", body=body).execute()
+        log(f"    YouTube metadata updated for video {youtube_video_id}.")
+        return True
+
+    except Exception as e:
+        log(f"    YouTube metadata update FAILED: {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
@@ -596,6 +665,22 @@ def supa_patch(table: str, match: dict, data: dict):
         timeout=15,
     )
     r.raise_for_status()
+
+
+def set_progress(job_id: str, message: str):
+    """
+    Write a human-readable progress message to video_jobs.status_detail so the
+    admin UI can show what stage the worker is in (creating notebook, downloading,
+    uploading to YouTube, etc.). Non-fatal -- swallows errors.
+    """
+    log(f"    [progress] {message}")
+    try:
+        supa_patch("video_jobs", {"id": job_id}, {
+            "status_detail": message,
+            "updated_at": now_iso(),
+        })
+    except Exception as e:
+        log(f"    set_progress failed (non-fatal): {e}")
 
 
 def supabase_upload_video(local_path: str, job_id: str) -> str:
@@ -658,8 +743,9 @@ async def process_queued_jobs():
 
             log(f"  Starting job {job_id[:8]} -- '{post_title}'")
             supa_patch("video_jobs", {"id": job_id}, {
-                "status": "processing",
-                "updated_at": now_iso(),
+                "status":        "processing",
+                "status_detail": "Creating NotebookLM notebook",
+                "updated_at":    now_iso(),
             })
 
             try:
@@ -669,6 +755,7 @@ async def process_queued_jobs():
                 nb        = await client.notebooks.create(nb_title)
                 nb_id     = nb.id
                 log(f"    Notebook created: {nb_id}")
+                set_progress(job_id, "Indexing blog content into NotebookLM")
 
                 # Source 1: blog post text (primary)
                 if post_text and len(post_text.strip()) > 100:
@@ -714,6 +801,7 @@ async def process_queued_jobs():
                         log(f"    Bridge source skipped (non-fatal): {bridge_err}")
 
                 # Fire video generation (standard Video Overview -- works with Pro)
+                set_progress(job_id, "Firing NotebookLM video generation")
                 status  = await client.artifacts.generate_video(
                     nb_id,
                     instructions=VIDEO_INSTRUCTION,
@@ -722,10 +810,11 @@ async def process_queued_jobs():
                 log(f"    Video job started: task_id={task_id}")
 
                 supa_patch("video_jobs", {"id": job_id}, {
-                    "notebook_id": nb_id,
-                    "task_id":     task_id,
-                    "status":      "processing",
-                    "updated_at":  now_iso(),
+                    "notebook_id":   nb_id,
+                    "task_id":       task_id,
+                    "status":        "processing",
+                    "status_detail": "NotebookLM rendering video (5–15 min)",
+                    "updated_at":    now_iso(),
                 })
 
                 nb_url = f"https://notebooklm.google.com/notebook/{nb_id}"
@@ -854,6 +943,7 @@ async def check_processing_jobs():
         # serves the actual MP4 rather than an auth redirect page.
         video_cdn_url = artifact["video_url"]
         log(f"    Video completed! Downloading from CDN...")
+        set_progress(job_id, "Downloading video from NotebookLM CDN")
 
         # Build httpx cookie jar from Playwright storage_state cookies
         cookie_jar = httpx.Cookies()
@@ -884,29 +974,39 @@ async def check_processing_jobs():
                 )
 
             # ── Step 1: Append BK outro card ────────────────────────────
+            set_progress(job_id, "Appending Bright Kids AI outro card")
             branded_path = append_outro(out_path, job_id)
 
             # ── Step 2: Extract first-frame thumbnail ────────────────────
+            set_progress(job_id, "Extracting thumbnail from first frame")
             thumb_path = create_thumbnail(branded_path, job_id)
 
             # ── Step 3: Upload branded video to Supabase Storage ────────
+            set_progress(job_id, "Uploading branded video to Supabase Storage")
             storage_url = supabase_upload_video(branded_path, job_id)
             log(f"    Uploaded to Supabase Storage: {storage_url}")
 
             # ── Step 4: Generate Gemini description ─────────────────────
+            set_progress(job_id, "Generating YouTube description with Gemini")
             post_text_for_desc = job.get("blog_post_content", "")
             description = generate_video_description(title, post_text_for_desc)
 
             # ── Step 5: Upload to YouTube ────────────────────────────────
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":        "uploading",
+                "status_detail": "Uploading to YouTube",
+                "updated_at":    now_iso(),
+            })
             yt_video_id = upload_to_youtube(branded_path, thumb_path, title, description)
 
             # ── Step 6: Update database ──────────────────────────────────
             final_url = f"https://youtu.be/{yt_video_id}" if yt_video_id else storage_url
             supa_patch("video_jobs", {"id": job_id}, {
-                "status":     "done",
-                "video_url":  final_url,
-                "video_path": branded_path,
-                "updated_at": now_iso(),
+                "status":        "done",
+                "status_detail": "Video live on YouTube" if yt_video_id else "Stored (YouTube upload skipped)",
+                "video_url":     final_url,
+                "video_path":    branded_path,
+                "updated_at":    now_iso(),
             })
 
             # ── Step 7: Cleanup local files ──────────────────────────────
@@ -941,6 +1041,64 @@ async def check_processing_jobs():
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: regenerate YouTube metadata only (no new video build)
+# ---------------------------------------------------------------------------
+
+def process_metadata_only_jobs():
+    """
+    Pick up jobs with status='metadata_queued' and refresh ONLY the YouTube
+    title + description for the existing video. The video itself is not
+    re-rendered. Sets status='done' on success or 'failed' on error.
+    """
+    jobs = supa_get("video_jobs", {
+        "status": "eq.metadata_queued",
+        "limit":  "5",
+        "order":  "created_at.asc",
+    })
+
+    if not jobs:
+        log("No metadata-only jobs.")
+        return
+
+    log(f"Refreshing YouTube metadata for {len(jobs)} job(s)...")
+
+    for job in jobs:
+        job_id    = job["id"]
+        title     = job.get("blog_post_title", "Untitled")
+        post_text = job.get("blog_post_content", "")
+        video_url = job.get("video_url", "") or ""
+
+        yt_id = _extract_youtube_id(video_url)
+        if not yt_id:
+            err = f"Cannot extract YouTube video ID from video_url: {video_url}"
+            log(f"  {err}")
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status": "failed", "error_message": err[:500], "updated_at": now_iso(),
+            })
+            continue
+
+        set_progress(job_id, f"Generating new description for '{title}'...")
+        description = generate_video_description(title, post_text)
+
+        set_progress(job_id, f"Updating YouTube metadata for {yt_id}...")
+        ok = update_youtube_metadata(yt_id, title, description)
+
+        if ok:
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":        "done",
+                "status_detail": "Metadata refreshed on YouTube",
+                "updated_at":    now_iso(),
+            })
+            notify(f"BK video metadata refreshed 📝\n'{title}'\nhttps://youtu.be/{yt_id}")
+        else:
+            supa_patch("video_jobs", {"id": job_id}, {
+                "status":        "failed",
+                "error_message": "YouTube metadata update failed -- see worker logs",
+                "updated_at":    now_iso(),
+            })
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -948,12 +1106,14 @@ async def main():
     log("=" * 55)
     log("BK Video Worker (Railway) -- start")
 
-    # Diagnostic: confirm which env vars actually reached the container
+    # Diagnostic: confirm which env vars actually reached the container.
+    # BK_OUTRO_URL falls back to a hardcoded constant if the env var is missing.
+    using_outro_fallback = (BK_OUTRO_URL == _BK_OUTRO_FALLBACK and not _envstr("BK_OUTRO_URL"))
     log(f"  ENV: SUPABASE_URL        = {'set (' + str(len(SUPABASE_URL)) + ' chars)' if SUPABASE_URL else 'MISSING'}")
     log(f"  ENV: SUPABASE_KEY        = {'set' if SUPABASE_KEY else 'MISSING'}")
     log(f"  ENV: GEMINI_API_KEY      = {'set' if GEMINI_API_KEY else 'MISSING'}")
     log(f"  ENV: YOUTUBE_TOKEN_B64   = {'set' if YOUTUBE_TOKEN_B64 else 'MISSING'}")
-    log(f"  ENV: BK_OUTRO_URL        = {BK_OUTRO_URL[:60] + '...' if len(BK_OUTRO_URL) > 60 else (BK_OUTRO_URL or 'MISSING')}")
+    log(f"  ENV: BK_OUTRO_URL        = {BK_OUTRO_URL[:80]}{' (FALLBACK -- env var empty)' if using_outro_fallback else ''}")
     log(f"  ENV: SESSION_B64         = {'set' if SESSION_B64 else 'MISSING'}")
 
     bootstrap_session()
@@ -961,6 +1121,7 @@ async def main():
 
     await process_queued_jobs()
     await check_processing_jobs()
+    process_metadata_only_jobs()
 
     log("BK Video Worker -- done")
     log("=" * 55)

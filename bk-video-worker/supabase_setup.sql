@@ -8,6 +8,7 @@ create table if not exists video_jobs (
   blog_post_url text,
   blog_post_content text,
   status text not null default 'queued',
+  status_detail text,
   notebook_id text,
   task_id text,
   video_path text,
@@ -16,6 +17,9 @@ create table if not exists video_jobs (
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+-- Add status_detail column to existing tables (idempotent)
+alter table video_jobs add column if not exists status_detail text;
 
 create index if not exists idx_video_jobs_status on video_jobs(status);
 create index if not exists idx_video_jobs_blog_post_id on video_jobs(blog_post_id);
