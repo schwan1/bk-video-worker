@@ -312,90 +312,131 @@ Rules:
 # Post-processing: outro, thumbnail, description, YouTube upload
 # ---------------------------------------------------------------------------
 
-def append_outro(video_path: str, job_id: str) -> str:
-    """
-    Download BK outro card from BK_OUTRO_URL and concatenate with main video.
-    Accepts either a PNG image URL (converted on-the-fly to a 5-sec silent MP4)
-    or a direct MP4 URL. Returns branded output path, or original if unavailable.
-    """
-    if not BK_OUTRO_URL:
-        log("    BK_OUTRO_URL not set -- skipping outro.")
-        return video_path
+OUTRO_PATH = OUTPUT_DIR / "bk_outro.mp4"
 
+
+class OutroAppendError(Exception):
+    """Raised when the BK outro card cannot be appended. The pipeline treats this
+    as fatal so the admin UI surfaces the real ffmpeg error instead of silently
+    publishing an outro-less video to YouTube."""
+
+
+def build_outro_card() -> tuple[bool, str]:
+    """
+    Download the outro asset from BK_OUTRO_URL and build a 5-second 1280x720
+    silent MP4 once per container run. Called at worker startup so any URL or
+    ffmpeg problems surface immediately, not buried inside a video job.
+
+    Returns (success, message). Message is printable detail for diagnostics.
+    """
     import subprocess
 
-    outro_path   = str(OUTPUT_DIR / "bk_outro.mp4")
+    if not BK_OUTRO_URL:
+        return False, "BK_OUTRO_URL is empty (env var missing AND fallback constant cleared)"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if OUTRO_PATH.exists() and OUTRO_PATH.stat().st_size > 1000:
+        return True, f"Already cached ({OUTRO_PATH.stat().st_size // 1024} KB)"
+
+    try:
+        r = httpx.get(BK_OUTRO_URL, timeout=60, follow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:
+        return False, f"Download from {BK_OUTRO_URL[:80]} failed: {e}"
+
+    content_type = r.headers.get("content-type", "")
+    is_image = "image" in content_type or BK_OUTRO_URL.lower().endswith(
+        (".png", ".jpg", ".jpeg", ".webp")
+    )
+
+    # Resolution chosen to match NotebookLM's 1280x720 default video output, so
+    # the concat step can copy streams without re-encoding the long source video.
+    if is_image:
+        png_path = OUTPUT_DIR / "bk_outro_card.png"
+        png_path.write_bytes(r.content)
+        try:
+            conv = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-loop", "1", "-i", str(png_path),
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-t", "5",
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-ar", "44100",
+                    "-pix_fmt", "yuv420p",
+                    "-r", "30",
+                    "-vf", (
+                        "scale=1280:720:force_original_aspect_ratio=decrease,"
+                        "pad=1280:720:(ow-iw)/2:(oh-ih)/2"
+                    ),
+                    "-shortest", str(OUTRO_PATH),
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            png_path.unlink(missing_ok=True)
+            if conv.returncode != 0:
+                return False, f"PNG→MP4 ffmpeg failed: {conv.stderr[-400:]}"
+        except subprocess.TimeoutExpired:
+            return False, "PNG→MP4 conversion timed out (120s)"
+        except Exception as e:
+            return False, f"PNG→MP4 conversion error: {e}"
+    else:
+        OUTRO_PATH.write_bytes(r.content)
+
+    if not OUTRO_PATH.exists() or OUTRO_PATH.stat().st_size < 1000:
+        return False, "Outro file was not created or is too small"
+
+    return True, f"Built {OUTRO_PATH.stat().st_size // 1024} KB at {OUTRO_PATH}"
+
+
+def append_outro(video_path: str, job_id: str) -> str:
+    """
+    Concatenate the cached BK outro to the end of the given video and return
+    the branded path. Raises OutroAppendError on failure so the pipeline can
+    surface the real error in status_detail/error_message instead of silently
+    skipping the outro.
+
+    Uses -preset ultrafast and a 15-minute timeout because Railway's CPU is
+    too slow to re-encode a 7+ minute 1080p video with the default preset
+    inside 5 minutes (which is what was silently failing before).
+    """
+    import subprocess
+
+    if not OUTRO_PATH.exists():
+        # Try to build it now if startup-build didn't run for some reason
+        ok, msg = build_outro_card()
+        if not ok:
+            raise OutroAppendError(f"Outro asset unavailable: {msg}")
+
     branded_path = str(OUTPUT_DIR / f"{job_id}_branded.mp4")
 
-    # Build outro MP4 once per container run (cached for subsequent jobs)
-    if not Path(outro_path).exists():
-        try:
-            log("    Downloading BK outro asset...")
-            r = httpx.get(BK_OUTRO_URL, timeout=60, follow_redirects=True)
-            r.raise_for_status()
-
-            content_type = r.headers.get("content-type", "")
-            is_image = "image" in content_type or BK_OUTRO_URL.lower().endswith(
-                (".png", ".jpg", ".jpeg", ".webp")
-            )
-
-            if is_image:
-                png_path = str(OUTPUT_DIR / "bk_outro_card.png")
-                Path(png_path).write_bytes(r.content)
-                log("    Converting outro PNG → 5-sec silent MP4...")
-                conv = subprocess.run(
-                    [
-                        "ffmpeg", "-y",
-                        "-loop", "1", "-i", png_path,
-                        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                        "-t", "5",
-                        "-c:v", "libx264", "-c:a", "aac",
-                        "-pix_fmt", "yuv420p",
-                        "-vf", (
-                            "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
-                        ),
-                        "-shortest", outro_path,
-                    ],
-                    capture_output=True, text=True, timeout=60,
-                )
-                Path(png_path).unlink(missing_ok=True)
-                if conv.returncode != 0:
-                    log(f"    Outro PNG→MP4 conversion failed (non-fatal): {conv.stderr[:300]}")
-                    return video_path
-                log("    Outro card converted to MP4 and cached.")
-            else:
-                Path(outro_path).write_bytes(r.content)
-                log(f"    Outro MP4 cached ({len(r.content) / 1024:.0f} KB).")
-
-        except Exception as e:
-            log(f"    Outro download/convert failed (non-fatal): {e}")
-            return video_path
-
-    # Concatenate using filter_complex so codec/resolution differences are handled
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", video_path,
-                "-i", outro_path,
+                "-i", str(OUTRO_PATH),
                 "-filter_complex",
-                "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+                "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[outv][outa]",
                 "-map", "[outv]", "-map", "[outa]",
-                "-c:v", "libx264", "-c:a", "aac",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-ar", "44100",
+                "-pix_fmt", "yuv420p",
                 branded_path,
             ],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=900,  # 15 min ceiling
         )
-        if result.returncode == 0 and Path(branded_path).exists():
-            log(f"    Outro appended: {branded_path}")
-            return branded_path
-        else:
-            log(f"    Outro append failed (non-fatal): {result.stderr[:300]}")
-            return video_path
+    except subprocess.TimeoutExpired:
+        raise OutroAppendError("Concat ffmpeg timed out after 15 minutes")
     except Exception as e:
-        log(f"    Outro append error (non-fatal): {e}")
-        return video_path
+        raise OutroAppendError(f"Concat ffmpeg crashed: {e}")
+
+    if result.returncode != 0 or not Path(branded_path).exists():
+        raise OutroAppendError(f"Concat ffmpeg failed (rc={result.returncode}): {result.stderr[-400:]}")
+
+    log(f"    Outro appended: {branded_path}")
+    return branded_path
 
 
 def create_thumbnail(video_path: str, job_id: str) -> str | None:
@@ -973,9 +1014,20 @@ async def check_processing_jobs():
                     f"Downloaded file is only {file_size} bytes -- likely an auth redirect, not a real video."
                 )
 
-            # ── Step 1: Append BK outro card ────────────────────────────
+            # ── Step 1: Append BK outro card (FATAL on failure now) ─────
             set_progress(job_id, "Appending Bright Kids AI outro card")
-            branded_path = append_outro(out_path, job_id)
+            try:
+                branded_path = append_outro(out_path, job_id)
+            except OutroAppendError as outro_err:
+                log(f"    OUTRO APPEND FAILED: {outro_err}")
+                supa_patch("video_jobs", {"id": job_id}, {
+                    "status":        "failed",
+                    "status_detail": "Outro append failed -- see error_message",
+                    "error_message": str(outro_err)[:1000],
+                    "updated_at":    now_iso(),
+                })
+                notify(f"BK video FAILED at outro step: '{title}'\n{str(outro_err)[:200]}")
+                continue
 
             # ── Step 2: Extract first-frame thumbnail ────────────────────
             set_progress(job_id, "Extracting thumbnail from first frame")
@@ -1118,6 +1170,17 @@ async def main():
 
     bootstrap_session()
     bootstrap_youtube()
+
+    # Build the BK outro card NOW so failures surface in startup logs, not
+    # buried inside an individual video job 10 minutes later.
+    log("  Building BK outro card...")
+    ok, msg = build_outro_card()
+    if ok:
+        log(f"  BK outro READY: {msg}")
+    else:
+        log(f"  BK outro FAILED at startup: {msg}")
+        log("  Videos will still be uploaded, but jobs will be marked FAILED")
+        log("  with the real ffmpeg error so you can see what went wrong.")
 
     await process_queued_jobs()
     await check_processing_jobs()
