@@ -58,21 +58,32 @@ GEMINI_MODEL_FALLBACKS = [
 ]
 
 VIDEO_INSTRUCTION = (
-    "Create an engaging, warm cinematic overview for parents of neurodiverse children. "
-    "Tone: empathetic, clear, and reassuring. Focus on practical takeaways and specific benefits. "
+    "Create an engaging cinematic video for parents of neurodiverse children. "
+    "NARRATIVE STRUCTURE -- follow this arc exactly: "
+    "(1) OPEN with the specific parent problem this blog post addresses. Name the scenario "
+    "concretely -- a moment a parent will immediately recognise ('Your child falls apart every "
+    "morning before school. You've tried everything. Here's what the research actually shows.'). "
+    "Do NOT open with a general empowerment statement or a definition. "
+    "(2) REFRAME -- introduce the counterintuitive or surprising finding that changes how the "
+    "parent understands the situation. This is the hook. Make it clear and prominent. "
+    "(3) EVIDENCE -- walk through what the research shows. Be specific: name the mechanism, "
+    "the study finding, or the expert insight. One concrete data point beats three vague claims. "
+    "(4) TACTICS -- show 2-3 specific things a parent can try this week. Not general advice -- "
+    "actual steps tied to the reframe. "
+    "(5) BRIGHT KIDS CONNECTION -- the third source describes Bright Kids AI tools. "
+    "Reference 1-2 of them by name ONLY where they directly address the specific problem in "
+    "this video. Write it as 'families are finding this helps' -- never a pitch, never a "
+    "call to action. If no tool fits naturally, skip this section entirely. "
+    "(6) CLOSE with one sentence that shifts the parent's perspective -- something that turns "
+    "guilt or frustration into understanding. "
+    "Tone: warm and direct. Speak to the tired parent at 11pm, not a conference audience. "
     "OPENING TITLE SLIDE: The very first slide must display the BLOG POST TITLE as the main, "
-    "prominent heading at the center of the frame. Add 'produced by Bright Kids AI' as a small "
-    "subtitle line below the title. Do NOT use 'Bright Kids AI' or the BK logo as the main title "
-    "of the opening slide -- the blog post title is always the headline; Bright Kids AI is only "
-    "the producer credit. "
-    "The third source describes the Bright Kids AI tools that families are already using. "
-    "Where it fits naturally -- not as a pitch, but as a 'families are finding this helps' moment -- "
-    "name one or two of those tools by name and show how they connect to what this article covers. "
-    "If a connection does not feel genuine, leave it out entirely. "
+    "prominent heading. Add 'produced by Bright Kids AI' as a small subtitle line. "
+    "The blog post title is always the headline; Bright Kids AI is only the producer credit. "
     "CRITICAL TEXT REQUIREMENT: Every text overlay, caption, callout bubble, label, and on-screen "
-    "graphic must contain clear, complete, fully-visible text. Never leave a text field, speech "
-    "bubble, or placeholder empty or blank. If a visual element is shown, it must display "
-    "readable, meaningful text that is relevant to the narration at that moment."
+    "graphic must contain clear, complete, fully-visible text. Never leave any text element "
+    "empty or blank. Every visual element must display readable, meaningful text relevant "
+    "to the narration at that moment."
 )
 
 # ---------------------------------------------------------------------------
@@ -288,13 +299,15 @@ Bright Kids AI offers these tools for families of neurodiverse children:
 - Jenny: a conversational parenting guide inside the app (short, warm responses for parents)
 - Child Profile: built with Sunny, drives all personalization (name, age, reading level, interests, favorite toy)
 
-Write a 150-200 word document (not a list, flowing prose) from a parent's perspective that explains:
-1. Which 1-2 of the above tools most naturally connect to what this blog post covers, and why
-2. How a parent would realistically use that tool alongside the strategies in this post during an actual week
+Write a 150-200 word document (not a list, flowing prose) from a parent's perspective that:
+1. Names the specific problem or scenario this post addresses (one sentence)
+2. Identifies which 1-2 of the above tools most naturally help with THAT SPECIFIC scenario
+3. Describes how a parent would realistically use that tool for this exact situation during an actual week
 
 Rules:
+- Ground every tool reference in the specific scenario from this post -- not the general topic.
 - Do not pitch or sell. Write as if describing what another parent already does.
-- Only reference tools that genuinely connect to the post topic. If none connect naturally, say so briefly and return only that sentence.
+- Only reference tools that genuinely connect to the specific scenario. If none connect naturally, write one sentence saying so and stop.
 - Do not mention prices, subscriptions, or calls to action.
 - Keep it under 200 words.
 """
