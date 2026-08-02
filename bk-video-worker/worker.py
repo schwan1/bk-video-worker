@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+from social_reels import process_social_reel_jobs
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1220,6 +1221,7 @@ async def main():
     await process_queued_jobs()
     await check_processing_jobs()
     process_metadata_only_jobs()
+    process_social_reel_jobs(supa_get, supa_patch, SUPABASE_URL, SUPABASE_KEY, OUTPUT_DIR, log, now_iso)
 
     log("BK Video Worker -- done")
     log("=" * 55)
